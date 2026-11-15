@@ -1,7 +1,9 @@
 """gui_shot.py —— 无交互截图 GUI，用于改完界面后自查布局。
 
 用法：
-    python build/diag/gui_shot.py [输出.bmp] [筛选词] [页面名]
+    python build/diag/gui_shot.py [输出.bmp] [筛选词] [页面名] [等待毫秒]
+
+第 4 个参数用于等异步结果落地（例如版本自检要联网，至少留 3000ms）。
 
 不触发提权（SYSGUARD_NO_ELEVATE=1），即使驱动未加载也能起界面。
 """
@@ -70,6 +72,7 @@ def main():
     out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "build", "diag", "gui.png")
     word = sys.argv[2] if len(sys.argv) > 2 else ""
     page = sys.argv[3] if len(sys.argv) > 3 else "proc"
+    delay = int(sys.argv[4]) if len(sys.argv) > 4 else 700
     if out.lower().endswith(".png"):
         out = out[:-4] + ".bmp"
 
@@ -94,7 +97,7 @@ def main():
         print("可见行数  :", len(app.proc_tree.get_children()))
         app.destroy()
 
-    app.after(700, shot)
+    app.after(delay, shot)
     app.mainloop()
     return 0
 
