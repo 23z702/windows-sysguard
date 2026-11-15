@@ -17,6 +17,7 @@
     python user\\update_check.py --json         # 机读（GUI/脚本用）
     python user\\update_check.py --force        # 忽略 6 小时缓存
     python user\\update_check.py --quiet        # 只在有新版本时输出
+    python user\\update_check.py --local 1.4.0  # 单独使用时手动指定本机版本
 
 退出码： 0 已是最新 / 10 有新版本 / 2 检查失败（网络、限流、解析）
 """
@@ -69,8 +70,18 @@ def fmt_version(tup):
     return ".".join(str(x) for x in tup)
 
 
-def local_version():
-    """本机发布版本：优先 VERSION 文件，其次解析驱动源码里的 GUARD_VERSION。"""
+def local_version(override=None):
+    """本机发布版本：参数 > 环境变量 > VERSION 文件 > 驱动源码里的 GUARD_VERSION。
+
+    把本文件单独拷到别的工程用时，没有 VERSION 也没有驱动源码，可以用
+    `--local 1.2.3` 或环境变量 SYGUARD_LOCAL_VERSION 指定，否则按 0.0.0 算（一定报有新版本）。
+    """
+    if override:
+        return str(override).strip().lstrip("vV")
+    env = os.environ.get("SYGUARD_LOCAL_VERSION")
+    if env and env.strip():
+        return env.strip().lstrip("vV")
+
     try:
         with open(VERSION_FILE, "r", encoding="utf-8") as f:
             txt = f.read().strip()
@@ -221,13 +232,13 @@ def _write_cache(obj):
 
 
 # ---------------- 对外主接口 ----------------
-def check(force=False, timeout=8, use_cache=True):
+def check(force=False, timeout=8, use_cache=True, local=None):
     """查一次版本，永远返回 dict，不抛异常。
 
     键：ok / local / latest / update / source / url / notes / published /
         checked_at / cached / error
     """
-    local = local_version()
+    local = local_version(local)
     now = time.time()
 
     if use_cache and not force:
@@ -310,7 +321,15 @@ def main(argv=None):
             print("--timeout 需要一个秒数", file=sys.stderr)
             return 2
 
-    res = check(force=force, timeout=timeout, use_cache=not force)
+    local = None
+    if "--local" in argv:
+        i = argv.index("--local")
+        if i + 1 >= len(argv):
+            print("--local 需要一个版本号，例如 --local 1.4.0", file=sys.stderr)
+            return 2
+        local = argv[i + 1]
+
+    res = check(force=force, timeout=timeout, use_cache=not force, local=local)
 
     if as_json:
         print(json.dumps(res, ensure_ascii=False, indent=2))

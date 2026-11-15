@@ -386,6 +386,7 @@ python user\update_check.py            # 人读
 python user\update_check.py --json     # 机读（GUI / 脚本用）
 python user\update_check.py --force    # 忽略 6 小时缓存
 python user\update_check.py --quiet    # 只在有新版本时输出
+python user\update_check.py --local 1.4.0   # 单独拷走用：手动指定本机版本
 ```
 
 输出长这样：
@@ -412,6 +413,10 @@ sysguard 版本自检
 - **任何失败都不抛给上层**：网络不通、限流、代理劫持都返回 `ok=False` + 中文原因，
   界面照常工作，驱动更不受影响（这个组件完全不碰驱动句柄）。
 - 退出码：`0` 已是最新 / `10` 有新版本 / `2` 检查失败 —— 方便挂到 CI 或脚本里。
+- **单独使用**：把 `update_check.py` 拷到任何目录都能跑（实测过：只拷这一个文件，
+  没有 `VERSION`、没有驱动源码也能正常查到 `v1.5.0`）。此时「本机版本」取
+  `--local` 或环境变量 `SYGUARD_LOCAL_VERSION`，都没有就按 `0.0.0` 算。
+  换仓库只改文件顶部的 `REPO` 常量（或在 `check()` 里传）。
 
 界面集成：「关于」页新增「版本自检」一行 + 「检查更新」按钮；启动 1.5 秒后还会**静默**查一次，
 有新版时标题栏右侧浮出橙色角标 `↑ 新版 v1.6.0`，点一下就打开 Release 页。
