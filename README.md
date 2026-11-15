@@ -482,6 +482,11 @@ python user\auto_update.py --status           # 当前版本、镜像路径与�
 - 不做灰度、不校验签名链的吊销状态；这是本地演示工程，不是企业更新通道。
 - 装机前请确认 `build\backups\` 所在磁盘有空间（每个备份约 12 KB，可以忽略，但别删了还指望 `--rollback`）。
 
+> **实测踩到的一个坑**：本机装了正版火绒，驱动停下的瞬间，`HKLM\SYSTEM\CurrentControlSet\Services\sysguard`
+> 会被顺手删掉（`sc start` 直接报 1060 服务不存在，4 次里能撞 3 次）。
+> 所以更新流程在动手前会把服务注册参数（`ImagePath` / `Start` / `ErrorControl` / `Group`）记进
+> `update_state.json`，启动时发现键没了就**按记录重建**再起。1.5.2 起才有这个自愈。
+
 
 ## 踩过的坑
 

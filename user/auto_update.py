@@ -219,7 +219,51 @@ def stop_driver(svc, wait=20):
     return False
 
 
-def start_driver(svc, wait=15):
+def read_service_spec(svc=None):
+    """把服务注册参数记下来。第三方安全软件会在驱动停下后顺手删掉服务键，
+    没有这份记录就没法重建（实测踩过：停完 err=1060 服务不存在）。"""
+    svc = svc or current_service()
+    ks = service_ctl.key_state(svc) or {}
+    return {
+        "name": svc,
+        "image_raw": ks.get("ImagePath"),
+        "start": ks.get("Start"),
+        "error_control": ks.get("ErrorControl"),
+        "group": ks.get("Group"),
+    }
+
+
+def ensure_service(spec, image):
+    """服务键不存在就按记录重建。返回 True 表示重建过。"""
+    svc = spec.get("name") or current_service()
+    if service_ctl.service_state(svc) is not None:
+        return False
+
+    print("  [!] 服务键已不存在（多半被安全软件清理了）→ 按更新前的记录重建")
+    start = spec.get("start")
+    if start not in (0, 1, 2, 3, 4):
+        start = 2                              # 记录不到就按开机自启兜底
+    if start in (0, 1):
+        start = 2                              # boot/system 在运行中的系统上起不来
+    if not service_ctl.do_create(svc, image, start):
+        raise UpdateFail("服务键被删了，重建也失败（可能被安全软件拦住）")
+
+    grp = spec.get("group")
+    if grp:
+        try:
+            import winreg
+            path = "SYSTEM" + chr(92) + "CurrentControlSet" + chr(92) + "Services" + chr(92) + svc
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path, 0, winreg.KEY_SET_VALUE) as k:
+                winreg.SetValueEx(k, "Group", 0, winreg.REG_SZ, grp)
+            print("  已恢复 Group=%s" % grp)
+        except OSError as e:
+            print("  [i] 补 Group 失败（不影响本次启动）：%s" % e)
+    return True
+
+
+def start_driver(svc, spec=None, image=None, wait=15):
+    if service_ctl.service_state(svc) is None and spec:
+        ensure_service(spec, image or spec.get("image_raw") or "")
     service_ctl.do_start(svc)
     for _ in range(wait * 10):
         if service_ctl.service_state(svc) == 4:
@@ -342,6 +386,10 @@ def install_driver(rel, dry=False):
     print("新版本    : %s" % rel["version"])
     print("资产      : %s (%.0f KB)" % (asset["name"], asset["size"] / 1024.0))
 
+    spec = read_service_spec(svc)
+    print("服务注册  : Start=%s ErrorControl=%s Group=%s"
+          % (spec.get("start"), spec.get("error_control"), spec.get("group")))
+
     if not os.path.isfile(image):
         raise UpdateFail("当前镜像不存在：%s" % image)
     if dry:
@@ -382,6 +430,7 @@ def install_driver(rel, dry=False):
     save_state({
         "when": time.strftime("%Y-%m-%d %H:%M:%S"),
         "service": svc, "image": image,
+        "service_spec": spec,
         "from_version": old_version, "to_version": rel["version"],
         "backup": backup, "new_sha256": got,
         "snapshot": snap,
@@ -400,8 +449,10 @@ def install_driver(rel, dry=False):
         print("  已写入 %s" % image)
 
         print("[6/6] 启动并校验")
-        if not start_driver(svc):
+        if not start_driver(svc, spec, image):
             raise UpdateFail("服务起不来（新驱动签名/依赖有问题）")
+        if service_ctl.key_state(svc) is None:
+            raise UpdateFail("服务键启动后又被删了（安全软件在拦），已回滚")
         now = sha256_file(image)
         if now != got:
             raise UpdateFail("镜像哈希对不上，写入可能被拦")
@@ -417,7 +468,7 @@ def install_driver(rel, dry=False):
         if stop_driver(svc):
             try:
                 replace_image(image, backup)
-                if start_driver(svc):
+                if start_driver(svc, spec, image):
                     print("  已回滚，服务恢复正常")
                     restore_snapshot(snap)
                 else:
@@ -515,10 +566,12 @@ def rollback():
 
     print("回滚目标：%s -> %s" % (st.get("to_version"), st.get("from_version") or "备份"))
     print("镜像    ：%s" % image)
+    spec = st.get("service_spec") or {}
+    spec.setdefault("name", svc)
     if not stop_driver(svc):
         raise UpdateFail("停不下来，回滚中止（没动文件）")
     replace_image(image, backup)
-    if not start_driver(svc):
+    if not start_driver(svc, spec, image):
         raise UpdateFail("回滚后服务起不来，镜像已换成备份，请手动检查")
     with guard_ctl.Guard() as g:
         v = g.query()["version"]
