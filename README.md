@@ -16,6 +16,7 @@ sys/
 │   ├─ guard_ctl.py        # IOCTL 封装（ctypes）
 │   ├─ update_check.py     # 版本自检：单独连 GitHub 查新版（可脱离本项目单独运行）
 │   ├─ auto_update.py      # 自动更新：下载 .sys → 停服务 → 换镜像 → 校验 → 失败回滚
+│   ├─ gh_mirror.py        # 下载加速：直连 + 多个镜像竞速，校验合格才采用（可单独运行）
 │   ├─ imgconv.py          # JPEG→PNG（走 Windows GDI+，头像用，零第三方依赖）
 │   ├─ sysguard.ico        # 应用图标（16/32/48/64/128/256 六种尺寸）
 │   ├─ logo_96.png         # 关于页项目图标
@@ -539,6 +540,62 @@ python user\auto_update.py --status           # 当前版本、镜像路径与�
 > 会被顺手删掉（`sc start` 直接报 1060 服务不存在，4 次里能撞 3 次）。
 > 所以更新流程在动手前会把服务注册参数（`ImagePath` / `Start` / `ErrorControl` / `Group`）记进
 > `update_state.json`，启动时发现键没了就**按记录重建**再起。1.5.2 起才有这个自愈。
+
+### 下载加速（多源竞速，1.5.4+）
+
+`user\gh_mirror.py` 负责所有「从 GitHub 下文件」的动作：Release 资产、`SHA256SUMS.txt`、源码包。
+国内直连 `github.com` 的下载经常只有几 KB/s 或直接被 reset，公共加速站是**前缀代理**
+（`https://站点/https://github.com/...`），可用性天天变，所以不写死一个站，而是多源同时开跑。
+
+```powershell
+python user\gh_mirror.py --test              # 测速体检：每个源下一遍仓库源码包，按耗时排序
+python user\gh_mirror.py --list              # 看候选源与历史成绩
+python user\gh_mirror.py --url <URL> --out <文件>   # 手动下载，自动选源
+
+python user\auto_update.py --check --test-mirrors   # 更新前的同款体检
+python user\auto_update.py --apply --mirror mirror  # 只用镜像（GitHub 完全连不上的网络）
+python user\auto_update.py --apply --no-mirror      # 只用直连
+```
+
+**注意：没有做成「镜像一律优先」**。本机实测直连 1.13 MB/s，比多数加速站还快，
+无条件走镜像只会更慢。所以默认是竞速：直连和镜像同时起跑，谁先拿到**校验合格**的文件用谁。
+
+2026-11 实测（下载本仓库源码包 170 KB，同一时刻六路并发）：
+
+| 源 | 结果 | 耗时 |
+|---|---|---|
+| `gh.monlor.com` | OK | 319 ms |
+| 直连 | OK | 344 ms |
+| `gh-proxy.org` | OK | 354 ms |
+| `cors.isteed.cc` | OK | 414 ms |
+| `gh-proxy.com` | OK，但大文件只有 0.15 MB/s | 1281 ms |
+| `ghfast.top` | 小文件 OK，2 MB 直接超时 | 3825 ms |
+
+同批探测里有一批站点**返回 200 但内容是 HTML 拦截页**（`gh-proxy.net`、`gitproxy.click`、`ghps.cc`），
+还有十几个域名已经彻底失效（DNS 不通）。完整名单写在 `gh_mirror.py` 文件末尾的注释里，
+下次改列表前先看那段，别把死站点加回来白等超时。
+
+所以每个源下完都要过四道关，任何一道不过就当这个源失败：
+
+1. `Content-Length` 与 Release 资产声明的大小一致（假页大多死在这步，不用下完就能判）
+2. 前 512 字节不能是 `<!DOCTYPE` / `<html` / `<?xml`（有些代理不发 `Content-Length`，只能看内容）
+3. `.tar.gz` 检查 gzip 魔数 `1f 8b`，避免 `tarfile.open` 抛「not a gzip file」这种看不懂的错
+4. `sha256` 与 `SHA256SUMS.txt` 一致
+
+实测把「200 + HTML」「长度对但内容全 0」两种假源插进候选列表，都会被踢掉并自动切到正常源，
+落地文件的 sha256 仍然正确。
+
+改源列表的三种方式（优先级从高到低）：
+
+```powershell
+$env:SYGUARD_MIRRORS = "https://a.com/,https://b.com/"   # 临时换候选
+$env:SYGUARD_MIRROR  = "off"                            # 等价 --no-mirror
+python user\gh_mirror.py --list                          # 看当前用的是哪些
+```
+
+长期改就编辑 `%LOCALAPPDATA%\sysguard\mirrors.json` 里的 `custom` 数组（该文件同时记录每个源的
+成功次数与最近耗时，竞速时会优先让成绩好的源先起跑）。`api.github.com` 的请求**不走镜像**——
+API 只有几 KB，且绝大多数加速站不代理 API。
 
 
 ## 踩过的坑

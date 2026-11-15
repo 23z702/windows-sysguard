@@ -23,6 +23,12 @@
     python user\\auto_update.py --rollback         # 回到上一次更新前的驱动
     python user\\auto_update.py --status           # 看当前装的是哪一版、备份在哪
 
+下载加速（Release 资产走 gh_mirror：直连 + 多个公共镜像同时竞速，先拿到合格文件的赢）：
+    python user\\auto_update.py --check --test-mirrors   # 先体检各镜像当前能不能用
+    python user\\auto_update.py --apply --mirror mirror  # 只用镜像，直连不参与（墙内）
+    python user\\auto_update.py --apply --no-mirror      # 只用直连
+    python user\\auto_update.py --apply --mirror https://gh.monlor.com/,https://gh-proxy.org/
+
 退出码：0 成功/无更新，1 失败（已回滚），2 参数或环境问题
 """
 
@@ -41,6 +47,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
+import gh_mirror          # noqa: E402  多源加速下载（竞速 + 校验）
 import guard_ctl          # noqa: E402
 import service_ctl        # noqa: E402
 import update_check       # noqa: E402
@@ -126,39 +133,22 @@ def release_info(timeout=15):
     raise UpdateFail("取不到 Release（HTTP %s），仓库可能还没发版" % st)
 
 
-def download(url, dest, timeout=120, label=""):
-    """下载到 dest，带进度。dest 已存在且大小一致就直接复用。"""
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    tmp = dest + ".part"
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            total = int(r.headers.get("Content-Length") or 0)
-            done = 0
-            with open(tmp, "wb") as f:
-                while True:
-                    chunk = r.read(1 << 16)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    done += len(chunk)
-                    if total and sys.stdout.isatty():
-                        sys.stdout.write("\r  下载 %-24s %5.1f%%"
-                                         % (label or os.path.basename(dest),
-                                            100.0 * done / total))
-                        sys.stdout.flush()
-        if total and sys.stdout.isatty():
-            sys.stdout.write("\n")
-    except urllib.error.HTTPError as e:
-        raise UpdateFail("下载失败 HTTP %s：%s" % (e.code, url))
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        raise UpdateFail("下载中断：%s" % e)
+def download(url, dest, timeout=120, label="", expect_size=0, sha256=None,
+             is_tar=None):
+    """多源加速下载：直连 + 多个公共镜像同时竞速，谁先拿到**校验合格**的文件用谁。
 
-    got = os.path.getsize(tmp)
-    if total and got != total:
-        os.unlink(tmp)
-        raise UpdateFail("下载不完整：%s / %s 字节" % (got, total))
-    os.replace(tmp, dest)
+    真正的实现在 gh_mirror.py，这里只做「失败转成 UpdateFail」的封装，
+    顺便把「有期望大小/哈希就校验」这条规则强制带上——镜像站里确实混着
+    返回 200 + HTML 拦截页的站点，不校验就可能把网页写成 .sys。
+    """
+    if is_tar is None:
+        is_tar = dest.lower().endswith((".tar.gz", ".tgz"))
+    try:
+        r = gh_mirror.download(url, dest, timeout=timeout, label=label,
+                               expect_size=expect_size, sha256=sha256,
+                               is_tar=is_tar, quiet=True, log=lambda m: print(m))
+    except gh_mirror.MirrorFail as e:
+        raise UpdateFail(str(e))
     return dest
 
 
@@ -373,20 +363,37 @@ def pick_driver_asset(rel):
 
 
 def expected_hash(rel, asset_name):
-    """从 Release 里的 SHA256SUMS.txt 取期望值；取不到返回 None（仍会做基本校验）。"""
+    """从 Release 里的 SHA256SUMS.txt 取期望值；取不到返回 None（仍会做基本校验）。
+
+    SUMS 自己也走多源下载——直连被墙的机器上，这一步过不去就等于把 sha256 校验
+    静默降级成「只比大小」，那是最不该省的一道关。
+    """
     sums = [a for a in rel["assets"] if a["name"].lower() == "sha256sums.txt"]
     if not sums:
         return None
+
+    fd, tmp = tempfile.mkstemp(prefix="sysguard-sums-")
+    os.close(fd)
+    raw = b""
     try:
-        st, raw = _get(sums[0]["url"], timeout=20, binary=True)
-        if st != 200 or not raw:
-            return None
-        for line in raw.decode("utf-8", "replace").splitlines():
-            parts = line.split()
-            if len(parts) >= 2 and parts[-1].lstrip("*") == asset_name:
-                return parts[0].lower()
+        download(sums[0]["url"], tmp, timeout=30, label="SHA256SUMS.txt",
+                 expect_size=sums[0].get("size") or 0)
+        with open(tmp, "rb") as f:
+            raw = f.read()
     except (UpdateFail, OSError):
         return None
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+    if not raw:
+        return None
+    for line in raw.decode("utf-8", "replace").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[-1].lstrip("*") == asset_name:
+            return parts[0].lower()
     return None
 
 
@@ -415,9 +422,11 @@ def install_driver(rel, dry=False):
     # 1) 下载 + 校验
     dest = os.path.join(DOWNLOADS, "v" + rel["version"], asset["name"])
     print("\n[1/6] 下载")
-    download(asset["url"], dest, label=asset["name"])
-    got = sha256_file(dest)
     want = expected_hash(rel, asset["name"])
+    # 期望值交给下载器，不合格的镜像在下载阶段就被踢掉，不用等落地再发现
+    download(asset["url"], dest, label=asset["name"],
+             expect_size=asset["size"], sha256=want)
+    got = sha256_file(dest)
     if want and got != want:
         os.unlink(dest)
         raise UpdateFail("校验失败：期望 %s…，实际 %s…" % (want[:16], got[:16]))
@@ -521,7 +530,9 @@ def update_app_files(rel, dry=False):
         return
 
     if not (os.path.isfile(dest) and os.path.getsize(dest) > 1024):
-        download(url, dest, label="%s.tar.gz" % tag)
+        # is_tar=True 让下载器检查 gzip 魔数：源码包被镜像站换成错误页的话，
+        # 后面 tarfile.open 会报一个莫名其妙的 "not a gzip file"，不如提前说清楚
+        download(url, dest, label="%s.tar.gz" % tag, is_tar=True)
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     backdir = os.path.join(BACKUPS, "app-" + stamp)
@@ -642,6 +653,24 @@ def main(argv=None):
     yes = "--yes" in argv or "-y" in argv
     with_app = "--all" in argv or "--with-app" in argv
     force = "--force" in argv
+
+    # 下载源：默认 auto（直连 + 镜像竞速）。墙内直连完全不通时用 --mirror mirror
+    mirror_mode = None
+    if "--mirror" in argv:
+        i = argv.index("--mirror")
+        if i + 1 >= len(argv):
+            print("--mirror 需要一个值：auto / mirror / off / <站点前缀>", file=sys.stderr)
+            return 2
+        mirror_mode = argv[i + 1]
+    if "--no-mirror" in argv:
+        mirror_mode = "off"
+    if mirror_mode:
+        os.environ["SYGUARD_MIRROR"] = mirror_mode
+
+    if "--test-mirrors" in argv:
+        rows = gh_mirror.probe()
+        gh_mirror._print_probe(rows)
+        return 0 if any(r["ok"] for r in rows) else 1
 
     if not any((do_check, do_apply, do_rollback, do_status)):
         print(__doc__)
