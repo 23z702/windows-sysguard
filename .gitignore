@@ -25,6 +25,7 @@ build/backups/
 syslog.txt
 killtest.log
 build/diag/*.bmp
+build/diag/*.png
 *.bmp
 
 # Python

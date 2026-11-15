@@ -13,6 +13,7 @@
 import ctypes
 import ctypes.wintypes as wt
 import datetime
+import math
 import os
 import subprocess
 import sys
@@ -43,6 +44,10 @@ try:
     import update_check          # 版本自检：只连 GitHub，不依赖驱动/管理员
 except ImportError:
     update_check = None
+try:
+    import imgconv               # JPEG -> PNG（头像用，走 Windows GDI+）
+except ImportError:
+    imgconv = None
 
 # ---------------- 配色（火绒风格：白底 + 品牌绿） ----------------
 C = {
@@ -65,6 +70,17 @@ F_H1 = (FONT, 22, "bold")
 F_BODY = (FONT, 10)
 F_SMALL = (FONT, 9)
 F_NUM = ("Segoe UI", 26, "bold")
+
+# ---------------- 应用身份（改名字/换作者只动这里） ----------------
+APP_NAME = "盾守"                       # 中文名
+APP_NAME_EN = "SysGuard"                # 与驱动名、仓库名保持一致
+APP_TAGLINE = "内核自保护驱动 · 在句柄阶段就剥掉强杀权限"
+APP_AUTHOR = "bixie"                    # 作者名（GitHub 显示名）
+APP_HANDLE = "23z702"                   # GitHub 账号
+APP_REPO = "23z702/windows-sysguard"
+APP_URL = "https://github.com/%s" % APP_REPO
+
+ICON_FILE = os.path.join(HERE, "sysguard.ico")
 
 k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
@@ -219,10 +235,14 @@ class App(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("火绒安全 · 仿制版  |  sysguard 自保护驱动演示")
+        self.title("%s %s  |  内核自保护驱动" % (APP_NAME, APP_NAME_EN))
         self.geometry("1060x690")
         self.minsize(980, 640)
         self.configure(bg=C["bg"])
+        try:
+            self.iconbitmap(default=ICON_FILE)      # 窗口 + 任务栏图标
+        except tk.TclError:
+            pass                                    # 图标丢了也不影响用
 
         self.guard = None
         self.driver_ok = False
@@ -240,6 +260,8 @@ class App(tk.Tk):
         self._connect_driver()
         self.show("home")
         self.after(300, self._tick)
+        self.after(800, self._load_avatar_async)          # 头像单独拉，不挡界面
+        self.after(1200, self._load_repo_meta_async)      # star 数
         self.after(1500, lambda: self.check_update(manual=False))
 
     # ---- 样式 ----
@@ -267,16 +289,27 @@ class App(tk.Tk):
         header.pack(fill="x", side="top")
         header.pack_propagate(False)
 
-        logo = tk.Canvas(header, width=40, height=40, bg=C["card"], highlightthickness=0)
-        logo.pack(side="left", padx=(22, 10))
-        logo.create_oval(3, 3, 37, 37, fill=C["green"], outline="")
-        logo.create_polygon(20, 10, 30, 15, 30, 22, 20, 31, 10, 22, 10, 15,
-                            fill="white", outline="")
-        logo.create_line(15, 20, 19, 24, 26, 16, fill=C["green"], width=2)
+        # 顶栏小 logo：优先用生成好的 PNG，读不到再退回手绘（保证任何情况下都有图标）
+        self._logo_img = None
+        try:
+            self._logo_img = tk.PhotoImage(file=os.path.join(HERE, "logo_40.png"))
+        except tk.TclError:
+            pass
+        if self._logo_img is not None:
+            tk.Label(header, image=self._logo_img, bg=C["card"]).pack(
+                side="left", padx=(22, 10))
+        else:
+            logo = tk.Canvas(header, width=40, height=40, bg=C["card"],
+                             highlightthickness=0)
+            logo.pack(side="left", padx=(22, 10))
+            logo.create_oval(3, 3, 37, 37, fill=C["green"], outline="")
+            logo.create_polygon(20, 10, 30, 15, 30, 22, 20, 31, 10, 22, 10, 15,
+                                fill="white", outline="")
+            logo.create_line(15, 20, 19, 24, 26, 16, fill=C["green"], width=2)
 
-        tk.Label(header, text="火绒安全", font=(FONT, 15, "bold"),
+        tk.Label(header, text=APP_NAME, font=(FONT, 15, "bold"),
                  bg=C["card"], fg=C["text"]).pack(side="left", pady=(0, 0))
-        tk.Label(header, text="仿制版 · sysguard", font=F_SMALL,
+        tk.Label(header, text="%s · 自保护驱动" % APP_NAME_EN, font=F_SMALL,
                  bg=C["card"], fg=C["sub"]).pack(side="left", padx=(8, 0), pady=(6, 0))
 
         self.pill = tk.Label(header, text="  检测中…  ", font=F_SMALL,
@@ -917,15 +950,173 @@ class App(tk.Tk):
         return {"version": label, "device": device, "image": image,
                 "service": svc or "未识别", "build": build}
 
+    def _build_about_head(self, parent):
+        """关于页顶部：项目 logo + 名字 + 作者头像 + 仓库地址 + Star。
+
+        布局用 pack 的左右两侧先占位：作者块先 pack 到右边，中间文本才会
+        在剩余空间里自适应；反过来写窗口一窄文字就把头像挤没了。
+        """
+        head = tk.Frame(parent, bg=C["card"])
+        head.pack(fill="x")
+
+        # --- 作者（右侧）---
+        author = tk.Frame(head, bg=C["card"])
+        author.pack(side="right", padx=(18, 0))
+
+        self.avatar_cv = tk.Canvas(author, width=64, height=64, bg=C["card"],
+                                   highlightthickness=0)
+        self.avatar_cv.pack(side="left")
+        who = tk.Frame(author, bg=C["card"])
+        who.pack(side="left", padx=(10, 0))
+        tk.Label(who, text=APP_AUTHOR, font=(FONT, 11, "bold"), bg=C["card"],
+                 fg=C["text"]).pack(anchor="w")
+        handle = tk.Label(who, text="@" + APP_HANDLE, font=F_SMALL, bg=C["card"],
+                          fg=C["green_dark"], cursor="hand2")
+        handle.pack(anchor="w", pady=(2, 0))
+        handle.bind("<Button-1>",
+                    lambda _e: webbrowser.open("https://github.com/" + APP_HANDLE))
+        self._paint_avatar(None)              # 先画占位，真头像拉到再替换
+
+        # --- 项目 logo（左侧）---
+        self._about_logo = None
+        try:
+            self._about_logo = tk.PhotoImage(file=os.path.join(HERE, "logo_96.png"))
+        except tk.TclError:
+            pass
+        if self._about_logo is not None:
+            tk.Label(head, image=self._about_logo, bg=C["card"]).pack(
+                side="left", padx=(0, 18))
+
+        # --- 名字（中间，占满剩余宽度）---
+        txt = tk.Frame(head, bg=C["card"])
+        txt.pack(side="left", fill="x", expand=True)
+        tk.Label(txt, text="%s %s" % (APP_NAME, APP_NAME_EN),
+                 font=(FONT, 20, "bold"), bg=C["card"], fg=C["text"]).pack(anchor="w")
+        tk.Label(txt, text=APP_TAGLINE, font=F_SMALL, bg=C["card"],
+                 fg=C["sub"]).pack(anchor="w", pady=(4, 0))
+        ver = tk.Label(txt, text="v" + (update_check.local_version() if update_check else "—"),
+                       font=F_SMALL, bg=C["card"], fg=C["green_dark"])
+        ver.pack(anchor="w", pady=(4, 0))
+        self.about_ver = ver
+
+        # --- 仓库地址 + Star（单独一行，别挤进头部）---
+        repo = tk.Frame(parent, bg=C["card"])
+        repo.pack(fill="x", pady=(16, 0))
+
+        url = tk.Label(repo, text="github.com/" + APP_REPO, font=(FONT, 9),
+                       bg=C["card"], fg=C["green_dark"], cursor="hand2")
+        url.pack(side="left")
+        url.bind("<Button-1>", lambda _e: webbrowser.open(APP_URL))
+
+        self.star_btn = self._btn(repo, "★  Star", self._open_repo, primary=True)
+        self.star_btn.pack(side="left", padx=(12, 0))
+        tk.Label(repo, text="觉得有用就点个星", font=F_SMALL, bg=C["card"],
+                 fg=C["sub"]).pack(side="left", padx=(10, 0))
+
+        tk.Frame(parent, bg=C["line"], height=1).pack(fill="x", pady=(14, 2))
+
+    def _open_repo(self):
+        """打开仓库主页（GitHub 没法用链接直接点 Star，只能把人带到页面）。"""
+        webbrowser.open(APP_URL)
+
+    # ---- 头像 ----
+    def _paint_avatar(self, png_path):
+        """把方图裁成圆：先贴图，再用四个 90° 扇形盖住四角。
+
+        Tk 没有圆角图片，但卡片是纯白的，用背景色扇形盖角是最省事又干净的做法。
+        """
+        cv = getattr(self, "avatar_cv", None)
+        if cv is None:
+            return
+        cv.delete("all")
+
+        img = None
+        if png_path:
+            try:
+                img = tk.PhotoImage(file=png_path)
+            except tk.TclError:
+                img = None
+        if img is not None:
+            w = img.width()
+            if w > 128:                       # 太大就降采样，Tk 只支持整数倍
+                k = max(2, w // 96)
+                img = img.subsample(k, k)
+            self._avatar_photo = img          # 必须留引用，否则被 GC 掉变白块
+            cv.create_image(32, 32, image=img)
+        else:
+            cv.create_oval(0, 0, 63, 63, fill=C["green_soft"], outline="")
+            cv.create_text(32, 32, text=(APP_AUTHOR[:1] or "?").upper(),
+                           font=(FONT, 22, "bold"), fill=C["green_dark"])
+
+        # 四角遮罩：Tk 没有圆角图片，用四块「直角 + 圆弧」的多边形把角盖掉。
+        # 注意别用 create_arc(style="pieslice")：扇形是从圆心出发的，
+        # 四个 90° 拼起来正好是整个圆盘，会把头像整张盖住（踩过）。
+        r = 32
+        for corner, a0, a1 in (((64, 0), 0, -90), ((64, 64), 0, 90),
+                               ((0, 64), 90, 180), ((0, 0), 180, 270)):
+            pts = [corner]
+            n = 14                                   # 弧线折线段数，14 段肉眼看不出棱角
+            for i in range(n + 1):
+                t = math.radians(a0 + (a1 - a0) * i / float(n))
+                pts.append((32 + r * math.cos(t), 32 + r * math.sin(t)))
+            cv.create_polygon(pts, fill=C["card"], outline="")
+
+    def _load_avatar_async(self):
+        """头像走子线程：几 MB 网速慢的时候不能卡住主窗口。"""
+        if update_check is None:
+            return
+
+        def work():
+            path = None
+            try:
+                raw = update_check.fetch_avatar(size=64)
+                if raw:
+                    png = os.path.splitext(raw)[0] + ".png"
+                    try:
+                        fresh = (os.path.isfile(png)
+                                 and os.path.getmtime(png) >= os.path.getmtime(raw))
+                    except OSError:
+                        fresh = False
+                    if fresh:
+                        path = png
+                    elif imgconv is not None and imgconv.to_png(raw, png):
+                        path = png
+            except Exception:
+                path = None
+            self.after(0, lambda: self._paint_avatar(path))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---- 仓库 star 数 ----
+    def _load_repo_meta_async(self):
+        if update_check is None:
+            return
+
+        def work():
+            meta = None
+            try:
+                meta = update_check.repo_meta()
+            except Exception:
+                meta = None
+            self.after(0, lambda: self._apply_repo_meta(meta))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_repo_meta(self, meta):
+        self.repo_meta = meta
+        if not meta or not meta.get("ok"):
+            return                                  # 拿不到就保持「★ Star」
+        n = meta.get("stars")
+        btn = getattr(self, "star_btn", None)
+        if btn is not None and isinstance(n, int):
+            btn.config(text=("★  Star %d" % n) if n else "★  Star")
+
     def _page_about(self):
         f = tk.Frame(self.content, bg=C["bg"])
         card = Card(f, padding=24)
         card.pack(fill="both", expand=True, padx=24, pady=(24, 24))
 
-        tk.Label(card.body, text="sysguard 自保护驱动", font=F_TITLE,
-                 bg=C["card"], fg=C["text"]).pack(anchor="w")
-        tk.Label(card.body, text="仿火绒自保护的 Windows 内核驱动演示工程",
-                 font=F_BODY, bg=C["card"], fg=C["sub"]).pack(anchor="w", pady=(2, 18))
+        self._build_about_head(card.body)
 
         info = self._live_driver_info()
         rows = [
@@ -934,14 +1125,12 @@ class App(tk.Tk):
             ("设备名", info["device"]),
             ("服务名", info["service"]),
             ("技术点", "ObRegisterCallbacks / CmRegisterCallbackEx / DriverUnload 拦截"),
-            ("强杀测试", "python user\\killtest.py --spawn"),
-            ("授权卸载", "python user\\guard_ctl.py  +  build\\uninstall.ps1"),
         ]
         # 这一页是在连接驱动之前就建好的，所以这几行必须留引用，切页时再刷新
         self.about_vals = {}
         for k, v in rows:
             row = tk.Frame(card.body, bg=C["card"])
-            row.pack(fill="x", pady=5)
+            row.pack(fill="x", pady=3)
             tk.Label(row, text=k, font=F_SMALL, bg=C["card"], fg=C["sub"],
                      width=10, anchor="w").pack(side="left")
             val = tk.Label(row, text=v, font=(FONT, 9), bg=C["card"],
@@ -953,7 +1142,7 @@ class App(tk.Tk):
 
         # 版本自检：单独连 GitHub 公开 API，与驱动是否加载、是否管理员都无关
         upd = tk.Frame(card.body, bg=C["card"])
-        upd.pack(fill="x", pady=(10, 0))
+        upd.pack(fill="x", pady=(8, 0))
         tk.Label(upd, text="版本自检", font=F_SMALL, bg=C["card"], fg=C["sub"],
                  width=10, anchor="w").pack(side="left")
         self.update_val = tk.Label(upd, text="未检查", font=(FONT, 9), bg=C["card"],
@@ -963,13 +1152,11 @@ class App(tk.Tk):
                   width=9).pack(side="left", padx=(10, 0))
 
         tk.Label(card.body, text="测试流程", font=(FONT, 10, "bold"),
-                 bg=C["card"], fg=C["text"]).pack(anchor="w", pady=(20, 6))
+                 bg=C["card"], fg=C["text"]).pack(anchor="w", pady=(14, 4))
         tk.Label(card.body,
-                 text=("1. 以管理员身份运行 build\\install.ps1 安装并加载驱动\n"
-                       "2. python user\\huorong_gui.py 打开界面，点「保护本程序」\n"
-                       "3. 打开任务管理器结束本程序 —— 会被内核拒绝\n"
-                       "4. python user\\killtest.py --spawn 跑完整强杀测试套件\n"
-                       "5. 卸载前先在「防护中心」关闭驱动自锁，再跑 uninstall.ps1"),
+                 text=("1. build\\install.ps1 安装加载，再用 python user\\huorong_gui.py 打开界面\n"
+                       "2. 点「保护本程序」后用任务管理器结束它 —— 会被内核拒绝\n"
+                       "3. python user\\killtest.py --spawn 完整验收；卸载前先在防护中心关自锁"),
                  font=F_SMALL, bg=C["card"], fg=C["sub"], justify="left").pack(anchor="w")
         return f
 
@@ -988,6 +1175,10 @@ class App(tk.Tk):
         # 切回「关于」页时把上次的自检结论重刷一遍（不重复发请求）
         if getattr(self, "update_info", None) and "update_val" in self.__dict__:
             self._apply_update_result(self.update_info, manual=False)
+
+        ver = getattr(self, "about_ver", None)
+        if ver is not None:
+            ver.config(text="v" + (update_check.local_version() if update_check else "—"))
 
     # ---------------- 版本自检（单独走 GitHub） ----------------
     def check_update(self, manual=True):

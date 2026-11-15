@@ -32,9 +32,12 @@ import urllib.request
 
 # ---------------- 常量 ----------------
 REPO = "23z702/windows-sysguard"
+OWNER = REPO.split("/")[0]
 API = "https://api.github.com"
 UA = "sysguard-update-check/1.0 (+https://github.com/%s)" % REPO
 CACHE_TTL = 6 * 3600          # 未认证 API 限流 60 次/小时，界面每次启动都查会被打满
+REPO_TTL = 6 * 3600           # 仓库信息（star 数）同版本一起缓存
+AVATAR_TTL = 7 * 24 * 3600    # 头像换得不勤，一周够了
 CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
                          "sysguard")
 
@@ -207,30 +210,118 @@ def fetch_latest(timeout=8):
 
 
 # ---------------- 缓存 ----------------
-def _cache_path():
-    return os.path.join(CACHE_DIR, "update.json")
+def _cache_path(name="update.json"):
+    return os.path.join(CACHE_DIR, name)
 
 
-def _read_cache():
+def _read_json(path):
     try:
-        with open(_cache_path(), "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             c = json.load(f)
         return c if isinstance(c, dict) else None
     except (OSError, ValueError):
         return None
 
 
-def _write_cache(obj):
+def _write_json(path, obj):
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
-        tmp = _cache_path() + ".tmp"
+        tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, _cache_path())
+        os.replace(tmp, path)
     except OSError:
         pass          # 缓存写不进去不影响结论
 
 
+def _read_cache():
+    return _read_json(_cache_path())
+
+
+def _write_cache(obj):
+    _write_json(_cache_path(), obj)
+
+
+# ---------------- 仓库信息（star 数 / 描述） ----------------
+def repo_meta(force=False, timeout=8, use_cache=True):
+    """取仓库公开信息，永远返回 dict，不抛异常。
+
+    键：ok / repo / stars / forks / url / desc / lang / pushed / cached / error
+    """
+    path = _cache_path("repo.json")
+    now = time.time()
+    if use_cache and not force:
+        c = _read_json(path)
+        if c and c.get("repo") == REPO and now - float(c.get("ts", 0)) < REPO_TTL:
+            c["cached"] = True
+            return c
+
+    res = {"ok": False, "repo": REPO, "stars": None, "forks": None,
+           "url": "https://github.com/%s" % REPO, "desc": "", "lang": "",
+           "pushed": "", "ts": now, "cached": False, "error": ""}
+    try:
+        st, d = _api("/repos/%s" % REPO, timeout)
+        if st == 200 and isinstance(d, dict):
+            res.update(ok=True,
+                       stars=d.get("stargazers_count"),
+                       forks=d.get("forks_count"),
+                       url=d.get("html_url") or res["url"],
+                       desc=d.get("description") or "",
+                       lang=d.get("language") or "",
+                       pushed=(d.get("pushed_at") or "")[:10])
+        elif st == 404:
+            res["error"] = "仓库不存在或已改名"
+        else:
+            res["error"] = "GitHub 返回 HTTP %s" % st
+    except UpdateError as e:
+        res["error"] = str(e)
+    except Exception as e:
+        res["error"] = "未知错误：%s" % e
+
+    if res["ok"]:
+        _write_json(path, res)
+    return res
+
+
+# ---------------- 头像 ----------------
+def avatar_file(size=64):
+    """原始头像的缓存路径（扩展名不确定：GitHub 给的是 JPEG）。
+    转 PNG 由界面侧的 imgconv 做，这里刻意不 import 它，保持本文件可单飞。"""
+    return _cache_path("avatar_%s_%d.img" % (OWNER, size))
+
+
+def fetch_avatar(force=False, timeout=8, size=64):
+    """把 GitHub 头像抓到本地缓存，返回本地路径；拿不到返回 None。
+
+    注意 GitHub 这个接口返回的是 **JPEG**（不是 PNG），而 tk 的 PhotoImage
+    不认 JPEG，所以调用方还要过一次格式转换。这里失败也不吭声——头像不该挡功能。
+    """
+    path = avatar_file(size)
+    try:
+        if not force and os.path.isfile(path) and os.path.getsize(path) > 512:
+            if time.time() - os.path.getmtime(path) < AVATAR_TTL:
+                return path
+    except OSError:
+        pass
+
+    url = "https://github.com/%s.png?size=%d" % (OWNER, size)
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    tok = _token()
+    if tok:
+        req.add_header("Authorization", "Bearer " + tok)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = r.read()
+        is_png = data[:8] == b"\x89PNG\r\n\x1a\n"
+        is_jpg = data[:3] == b"\xff\xd8\xff"
+        if len(data) < 512 or not (is_png or is_jpg):
+            return None
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+    except Exception:
+        return None
 # ---------------- 对外主接口 ----------------
 def check(force=False, timeout=8, use_cache=True, local=None):
     """查一次版本，永远返回 dict，不抛异常。

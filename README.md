@@ -1,11 +1,14 @@
-# sysguard —— 仿火绒自我保护驱动 + 强杀测试
+# 盾守 SysGuard —— 仿火绒自我保护驱动 + 强杀测试
 
 一套自包含的 Windows 内核自保护演示工程：内核驱动在**句柄层**拦截对受保护进程的强杀/注入，
 配套一个仿火绒界面和一个强杀测试套件，用 10 种真实攻击手法验证防护是否成立。
 
+> 中文名「盾守」，英文 `SysGuard`，与驱动名、仓库名一致；界面上的名字集中在
+> `user/huorong_gui.py` 顶部的 `APP_NAME / APP_AUTHOR / APP_REPO` 三个常量里，改一处全站生效。
+
 ```
 sys/
-├─ VERSION                 # 发布版本 1.5.0，与 GitHub tag v1.5.0 对齐（版本自检只比这个）
+├─ VERSION                 # 发布版本 1.5.3，与 GitHub tag v1.5.3 对齐（版本自检只比这个）
 ├─ driver/
 │   └─ sysguard.c          # 内核驱动（WDM，约 1300 行）
 ├─ user/
@@ -13,6 +16,10 @@ sys/
 │   ├─ guard_ctl.py        # IOCTL 封装（ctypes）
 │   ├─ update_check.py     # 版本自检：单独连 GitHub 查新版（可脱离本项目单独运行）
 │   ├─ auto_update.py      # 自动更新：下载 .sys → 停服务 → 换镜像 → 校验 → 失败回滚
+│   ├─ imgconv.py          # JPEG→PNG（走 Windows GDI+，头像用，零第三方依赖）
+│   ├─ sysguard.ico        # 应用图标（16/32/48/64/128/256 六种尺寸）
+│   ├─ logo_96.png         # 关于页项目图标
+│   ├─ logo_40.png         # 顶栏项目图标
 │   ├─ elevate.py          # 自动提权（UAC，两条通道）
 │   ├─ killtest.py         # 强杀测试套件（10 项）
 │   ├─ forcekill_test.py   # 驱动级强制结束进程的验收（4 场景 7 项）
@@ -21,6 +28,7 @@ sys/
 │   └─ unload_driver.py    # 下发卸载令牌
 └─ build/
     ├─ build.sh            # 编译驱动（cl + link，不依赖 MSBuild）
+    ├─ make_icon.py        # 生成应用图标（纯 Python 光栅化，不需要 Pillow）
     ├─ sign.ps1            # 自签证书 + 签名
     ├─ release.py          # 发版：体检 → 打 tag + push → 建 GitHub Release
     ├─ install.ps1         # 安装并加载服务（幂等；重名自动顺延）
@@ -421,6 +429,51 @@ sysguard 版本自检
 
 界面集成：「关于」页新增「版本自检」一行 + 「检查更新」按钮；启动 1.5 秒后还会**静默**查一次，
 有新版时标题栏右侧浮出橙色角标 `↑ 新版 v1.6.0`，点一下就打开 Release 页。
+
+### 关于页与图标
+
+「关于」页是一张项目名片，所有内容都是运行时取的，没有一处写死在界面上：
+
+| 元素 | 来源 |
+|---|---|
+| 项目图标 | `user/logo_96.png`，由 `build/make_icon.py` 生成 |
+| 版本号 | 根目录 `VERSION` |
+| 作者头像 | GitHub 头像，首次联网下载后缓存 7 天（`%LOCALAPPDATA%\sysguard\avatar_*.img`）|
+| 最新版本 | `releases/latest`，和「检查更新」共用一份缓存 |
+| ★ Star 数 | `GET /repos/...` 的 `stargazers_count`，缓存 6 小时 |
+
+改名 / 换作者只动 `user/huorong_gui.py` 顶部这几个常量，窗口标题、顶栏、关于页一起变：
+
+```python
+APP_NAME = "盾守"          # 中文名
+APP_NAME_EN = "SysGuard"
+APP_AUTHOR = "bixie"
+APP_HANDLE = "23z702"
+APP_REPO = "23z702/windows-sysguard"
+```
+
+图标不用任何绘图软件、也不需要 Pillow：`build/make_icon.py` 用纯 Python 逐像素光栅化
+（2 倍超采样后盒式降采样做抗锯齿），一次输出 `sysguard.ico`（16/32/48/64/128/256 六种尺寸）
+和界面用的 `logo_96.png` / `logo_40.png`。改配色或形状后重跑一次即可：
+
+```powershell
+python build\make_icon.py --preview     # 同时导出 256px PNG 方便肉眼检查
+```
+
+头像这一路有三个坑，都踩过了：
+
+1. **GitHub 的 `https://github.com/<user>.png` 返回的是 JPEG**（不管你传什么 `Accept`），
+   而 tk 的 `PhotoImage` 只认 PNG/GIF。项目又不想为了转码引入 Pillow，
+   所以 `user/imgconv.py` 用 ctypes 调 Windows 自带的 GDI+ 转一次格式。
+2. **别去遍历 `GdipGetImageEncoders` 找 PNG 编码器**：`ImageCodecInfo` 结构体在不同位数下
+   布局不一致，字段错一位就是进程级 segfault（实测崩过）。直接用 PNG 的固定 CLSID
+   `{557CF406-1A04-11D3-9A73-0000F81EF32E}`。
+3. **tk 没有圆角图片**。把方图裁成圆不能用 `create_arc(style="pieslice")` —— 扇形从圆心发出，
+   四个 90° 拼起来正好是整个圆盘，会把头像整张盖住（第一版就是这么糊掉的）。
+   正确做法是用四块「直角 + 圆弧」的 `create_polygon` 把四个角盖掉。
+   另外 `tk.PhotoImage` 必须留引用（`self._avatar_photo = img`），否则被 GC 回收后显示白块。
+
+拿不到头像（离线 / 被墙）时不会留空，会画一个绿底首字母圆形占位，功能不受影响。
 
 ### 发版：让「检测」有东西可比对
 

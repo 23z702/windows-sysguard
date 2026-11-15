@@ -505,7 +505,7 @@ def install_driver(rel, dry=False):
 
 
 def update_app_files(rel, dry=False):
-    """更新用户层运行文件：user/*.py、README.md、VERSION。
+    """更新用户层运行文件：user/*.py、user/*.ico、user/logo_*.png、README.md、VERSION。
 
     只碰「运行时会用到的文件」，不碰 build/ 下的脚本与任何本地配置；
     每个被覆盖的文件先备份到 build\\backups\\app-<时间>\\。
@@ -516,7 +516,8 @@ def update_app_files(rel, dry=False):
 
     print("用户层源码: %s" % url)
     if dry:
-        print("[dry-run] 将解包并把 user/*.py、README.md、VERSION 覆盖到项目目录")
+        print("[dry-run] 将解包并把 user/*.py、user/*.ico、user/logo_*.png、"
+              "README.md、VERSION 覆盖到项目目录")
         return
 
     if not (os.path.isfile(dest) and os.path.getsize(dest) > 1024):
@@ -536,7 +537,9 @@ def update_app_files(rel, dry=False):
                 if len(parts) != 2:
                     continue
                 relp = parts[1]
-                keep = (relp.startswith("user/") and relp.endswith(".py")) or \
+                keep = (relp.startswith("user/")
+                        and (relp.endswith(".py") or relp.endswith(".ico")
+                             or os.path.basename(relp).startswith("logo_"))) or \
                        relp in ("README.md", "VERSION")
                 if not keep or "__pycache__" in relp:
                     continue
@@ -690,7 +693,16 @@ def main(argv=None):
             return 2
 
     try:
-        install_driver(rel, dry=dry)
+        # 纯用户层发版（Release 里没带 .sys）时别硬报错：驱动没变就不该为了
+        # 一个界面改动去停一次服务——那几秒是没有保护的。
+        if pick_driver_asset(rel) is None:
+            if not with_app:
+                print("[i] 这次 Release 只带源码（没有 .sys），驱动保持不动。")
+                print("    想一起更新界面/脚本： --all")
+            else:
+                print("[i] 这次 Release 没带 .sys 资产，跳过驱动步骤，只更新用户层。")
+        else:
+            install_driver(rel, dry=dry)
         if with_app:
             update_app_files(rel, dry=dry)
     except UpdateFail as e:
