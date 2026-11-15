@@ -19,11 +19,13 @@ update_check.py 只看 GitHub 的 Release/Tag，所以「有新版本」这件�
 前置：新增/修改的文件要**先自己 commit**，本脚本只在 --version 改过 VERSION 时替你提交这一个文件。
 """
 
+import hashlib
 import json
 import os
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 REPO = "23z702/windows-sysguard"
@@ -120,17 +122,57 @@ def default_notes(prev_tag):
     return "## 变更\n\n" + (log or "- （无提交记录）") + "\n"
 
 
+def sha256_of(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def upload_asset(upload_url, path, tok, label=None):
+    """把文件传到 Release 的 assets（GitHub 用 raw body，不需要 multipart）。"""
+    name = os.path.basename(path)
+    base = upload_url.split("{")[0]
+    q = {"name": name}
+    if label:
+        q["label"] = label
+    url = base + "?" + urllib.parse.urlencode(q)
+
+    with open(path, "rb") as f:
+        payload = f.read()
+
+    req = urllib.request.Request(url, data=payload, method="POST", headers={
+        "User-Agent": "sysguard-release/1.0",
+        "Accept": "application/vnd.github+json",
+        "Authorization": "Bearer " + tok,
+        "Content-Type": "application/octet-stream",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return r.status, json.loads(r.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            body = {}
+        return e.code, body
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     dry = "--dry-run" in argv
     prerelease = "--prerelease" in argv
     ver = None
     notes_file = None
+    assets = []
     for i, a in enumerate(argv):
         if a == "--version" and i + 1 < len(argv):
             ver = argv[i + 1].lstrip("vV")
         if a == "--notes-file" and i + 1 < len(argv):
             notes_file = argv[i + 1]
+        if a == "--asset" and i + 1 < len(argv):
+            assets.append(argv[i + 1])
 
     ver = ver or read_version()
 
@@ -164,6 +206,12 @@ def main(argv=None):
         print("    git tag -a %s" % tag)
         print("    git push origin main && git push origin %s" % tag)
         print("    POST /repos/%s/releases" % REPO)
+        for a in assets:
+            if not os.path.isfile(a):
+                raise SystemExit("[FAIL] 资产不存在：%s" % a)
+            print("    上传资产 %s  (sha256=%s…)" % (a, sha256_of(a)[:16]))
+        if assets:
+            print("    上传 SHA256SUMS.txt（自动生成，供自动更新校验完整性）")
         return 0
 
     # ---- 2. 改版本 -> 提交 -> 打 tag -> 推 ----
@@ -205,6 +253,41 @@ def main(argv=None):
 
     if st in (200, 201) and isinstance(body, dict):
         print("[3/3] Release 已创建：%s" % body.get("html_url"))
+
+        if assets:
+            up = body.get("upload_url", "")
+            sums_path = os.path.join(ROOT, "build", "SHA256SUMS.txt")
+            lines = []
+            ok_all = True
+            for a in assets:
+                if not os.path.isfile(a):
+                    print("[FAIL] 资产不存在：%s" % a)
+                    ok_all = False
+                    continue
+                digest = sha256_of(a)
+                lines.append("%s  %s" % (digest, os.path.basename(a)))
+                code, r = upload_asset(up, a, tok)
+                if code in (200, 201):
+                    print("  [asset] %-28s %s" % (os.path.basename(a),
+                                                  "%.1f MB" % (os.path.getsize(a) / 1048576)))
+                else:
+                    ok_all = False
+                    print("  [FAIL] 上传 %s 失败 HTTP %s：%s"
+                          % (os.path.basename(a), code, (r or {}).get("message")))
+
+            # 校验清单最后传：自动更新先拉它，再核对 .sys 的 sha256
+            with open(sums_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("\n".join(lines) + "\n")
+            code, _ = upload_asset(up, sums_path, tok)
+            print("  [asset] SHA256SUMS.txt             %s" % ("ok" if code in (200, 201)
+                                                             else "FAIL HTTP %s" % code))
+            print("\n资产清单：")
+            for line in lines:
+                print("    " + line)
+            if not ok_all:
+                print("\n[!] 有资产没传成功，自动更新会退回「只更新用户层」。"
+                      "到 Release 页面手动补传即可。")
+
         print("\n验证： python user\\update_check.py --force")
         return 0
 

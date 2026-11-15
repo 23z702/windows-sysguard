@@ -12,6 +12,7 @@ sys/
 │   ├─ huorong_gui.py      # 仿火绒界面（tkinter，零依赖）
 │   ├─ guard_ctl.py        # IOCTL 封装（ctypes）
 │   ├─ update_check.py     # 版本自检：单独连 GitHub 查新版（可脱离本项目单独运行）
+│   ├─ auto_update.py      # 自动更新：下载 .sys → 停服务 → 换镜像 → 校验 → 失败回滚
 │   ├─ elevate.py          # 自动提权（UAC，两条通道）
 │   ├─ killtest.py         # 强杀测试套件（10 项）
 │   ├─ forcekill_test.py   # 驱动级强制结束进程的验收（4 场景 7 项）
@@ -438,6 +439,48 @@ tag 已存在。令牌按 `GITHUB_TOKEN` 环境变量 → Windows 凭据管理�
 
 > 本机 git 配的是 openssl 后端且缺 CA 链，`push` 会报 `unable to get local issuer certificate`。
 > `release.py` 检测到这个错会**只对这一条命令**关掉校验重试一次，并明确打印出来，不动全局配置。
+
+### 自动更新（真正把新版装上去）
+
+`user\auto_update.py` 负责「装了它」：从 Release 下载签名好的 `.sys`，就地替换**正在运行**的那一份。
+
+```powershell
+python user\auto_update.py --check            # 只看有没有新版（等同 update_check）
+python user\auto_update.py --apply --dry-run  # 打印计划，一个文件都不动
+python user\auto_update.py --apply            # 只更新驱动
+python user\auto_update.py --apply --all      # 驱动 + 用户层 py / README / VERSION
+python user\auto_update.py --rollback         # 退回上一次更新前的驱动
+python user\auto_update.py --status           # 当前版本、镜像路径与哈希、备份在哪
+```
+
+为什么不能「下载完直接覆盖」：驱动被 SCM 映射着，文件是占用的；而且本工程驱动默认带自锁，
+`sc stop` 会被直接拒绝。所以顺序是固定的，每一步失败都能退回去：
+
+```
+1. 取 Release → 挑 .sys 资产 → 核对 SHA256SUMS      （不动任何东西）
+2. 快照：防护开关 + 保护名单                          （驱动重启后是内存态，不存就丢）
+3. 备份当前 .sys 到 build\backups\
+4. 关自锁 → 下发卸载令牌 → 停服务（等到真的 STOPPED）
+5. 覆盖镜像（重试 12 次，刚停的驱动要几百毫秒才放开文件）
+6. 起服务 → 连设备 → 比对文件哈希 + 服务状态
+7. 任一步失败：停 → 恢复备份 → 起服务 → 恢复开关，原样退回去
+8. 成功：把防护开关和保护名单按第 2 步的快照恢复
+```
+
+几个刻意的取舍：
+
+- **只换镜像，不动服务键**。`ImagePath`、`Start=2`、服务名都保持原样，所以开机自启不会因为更新而失效。
+- **只更新运行时文件**（`user/*.py`、`README.md`、`VERSION`），不碰 `build/` 下的脚本和任何本地配置；
+  每个被覆盖的文件先备份到 `build\backups\app-<时间>\`，内容相同则跳过（保留你的本地修改时间）。
+- **更新前先松开自己**：界面触发更新时会把本地设备句柄关掉再起子进程，否则我们自己就占着设备。
+- 更新完界面里那段代码还是内存里的旧版，**重启界面**才完全生效。
+
+边界（别指望它做这些）：
+
+- 新驱动必须**已经签好名**，且证书在本机受信任根里（自签名 + `testsigning on` 那条路）。
+  签名不对 → 服务起不来 → 自动回滚，机器不会失去保护。
+- 不做灰度、不校验签名链的吊销状态；这是本地演示工程，不是企业更新通道。
+- 装机前请确认 `build\backups\` 所在磁盘有空间（每个备份约 12 KB，可以忽略，但别删了还指望 `--rollback`）。
 
 
 ## 踩过的坑

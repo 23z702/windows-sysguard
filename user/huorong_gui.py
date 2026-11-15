@@ -29,6 +29,7 @@ except ImportError:
     raise SystemExit(1)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 try:
     import guard_ctl
@@ -1038,12 +1039,18 @@ class App(tk.Tk):
             return
         if has_new:
             notes = (res.get("notes") or "").strip()
-            messagebox.showinfo(
+            tip = (notes[:600] + ("…" if len(notes) > 600 else "")) if notes else "（无发布说明）"
+            ans = messagebox.askyesnocancel(
                 "发现新版本 %s" % res["latest"],
-                "当前版本：%s\n最新版本：%s\n\n%s\n\n点「确定」打开下载页。"
-                % (res.get("local"), res["latest"],
-                   (notes[:800] + ("…" if len(notes) > 800 else "")) if notes else "（无发布说明）"))
-            self._open_release()
+                "当前版本：%s\n最新版本：%s\n\n%s\n\n"
+                "【是】自动更新：下载并替换驱动（会短暂停止保护，失败自动回滚）\n"
+                "【否】只打开下载页，自己手动装\n"
+                "【取消】以后再说"
+                % (res.get("local"), res["latest"], tip))
+            if ans is True:
+                self.run_auto_update()
+            elif ans is False:
+                self._open_release()
         else:
             messagebox.showinfo("检查更新", "已是最新版本 %s。" % res.get("local"))
 
@@ -1053,6 +1060,63 @@ class App(tk.Tk):
             url = "https://github.com/%s/releases" % update_check.REPO
         if url:
             webbrowser.open(url)
+
+    def run_auto_update(self):
+        """跑 user\\auto_update.py --apply --all，输出回填到对话框。
+
+        更新会停驱动，所以先把本地设备句柄关掉——否则我们自己就是「占着设备的进程」，
+        更新完再 _connect_driver 重连。
+        """
+        script = os.path.join(HERE, "auto_update.py")
+        if not os.path.isfile(script):
+            messagebox.showwarning("自动更新", "缺少 user\\auto_update.py")
+            return
+        if self._update_busy:
+            return
+        self._update_busy = True
+
+        if self.guard is not None:
+            try:
+                self.guard.close()
+            except Exception:
+                pass
+            self.guard = None
+        self.driver_ok = False
+        self.pill.config(text="  正在更新…  ", bg="#FFF4E5", fg="#9A5B00")
+
+        def work():
+            rc, out = 1, ""
+            try:
+                p = subprocess.run(
+                    [sys.executable, script, "--apply", "--yes", "--all"],
+                    cwd=ROOT, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=600,
+                    env=dict(os.environ, PYTHONIOENCODING="utf-8"),
+                    creationflags=0x08000000)          # CREATE_NO_WINDOW
+                rc, out = p.returncode, (p.stdout or "") + (p.stderr or "")
+            except Exception as e:
+                out = "启动更新进程失败：%s" % e
+            self.after(0, lambda: self._auto_update_done(rc, out))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _auto_update_done(self, rc, out):
+        self._update_busy = False
+        self._connect_driver()                          # 驱动可能已经换成新版
+        if "update_val" in self.__dict__:
+            self.update_val.config(text="已更新，重启界面完全生效" if rc == 0 else "更新失败",
+                                   fg=C["sub"] if rc == 0 else C["red"])
+
+        tail = "\n".join(out.strip().splitlines()[-22:]) or "（无输出）"
+        if rc == 0:
+            self.update_info = None
+            self.update_pill.pack_forget()
+            messagebox.showinfo("更新完成",
+                                "驱动已更新。\n用户层代码改动需要重启界面才生效。\n\n" + tail)
+        else:
+            messagebox.showerror("更新失败",
+                                 "已按流程回滚（如未回滚请手看日志）。\n"
+                                 "可用 python user\\auto_update.py --status 复查。\n\n" + tail)
 
     # ---------------- 驱动交互 ----------------
     def _connect_driver(self):
