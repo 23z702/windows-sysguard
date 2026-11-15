@@ -8,6 +8,12 @@
 build/obj/
 build/old/
 build/shots/
+build/dist/
+
+# 发版时 release.py 自动生成的校验清单（内容随资产变，不入库）
+build/SHA256SUMS.txt
+build/downloads/
+build/backups/
 
 # 签名材料（含私钥，绝不入库）
 *.pfx
