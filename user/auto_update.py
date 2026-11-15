@@ -233,6 +233,15 @@ def read_service_spec(svc=None):
     }
 
 
+def _set_service_value(svc, name, value):
+    """直接写服务键的某个值。驱动没在跑时不会被它自己的注册表回调拦住。"""
+    import winreg
+    path = "SYSTEM" + chr(92) + "CurrentControlSet" + chr(92) + "Services" + chr(92) + svc
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path, 0, winreg.KEY_SET_VALUE) as k:
+        winreg.SetValueEx(k, name, 0, winreg.REG_SZ if isinstance(value, str) else winreg.REG_DWORD,
+                          value)
+
+
 def ensure_service(spec, image):
     """服务键不存在就按记录重建。返回 True 表示重建过。"""
     svc = spec.get("name") or current_service()
@@ -251,13 +260,20 @@ def ensure_service(spec, image):
     grp = spec.get("group")
     if grp:
         try:
-            import winreg
-            path = "SYSTEM" + chr(92) + "CurrentControlSet" + chr(92) + "Services" + chr(92) + svc
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path, 0, winreg.KEY_SET_VALUE) as k:
-                winreg.SetValueEx(k, "Group", 0, winreg.REG_SZ, grp)
+            _set_service_value(svc, "Group", grp)
             print("  已恢复 Group=%s" % grp)
         except OSError as e:
             print("  [i] 补 Group 失败（不影响本次启动）：%s" % e)
+
+    # CreateServiceW 会把路径写成 \??\C:\...，不如原来的 \SystemRoot\...
+    # 稳妥（换盘符/改系统目录就失效），能恢复就恢复。
+    raw = spec.get("image_raw")
+    if raw:
+        try:
+            _set_service_value(svc, "ImagePath", raw)
+            print("  已恢复 ImagePath=%s" % raw)
+        except OSError as e:
+            print("  [i] 恢复 ImagePath 原写法失败（不影响本次启动）：%s" % e)
     return True
 
 
