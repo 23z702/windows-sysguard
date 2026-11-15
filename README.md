@@ -5,11 +5,13 @@
 
 ```
 sys/
+├─ VERSION                 # 发布版本 1.5.0，与 GitHub tag v1.5.0 对齐（版本自检只比这个）
 ├─ driver/
-│   └─ sysguard.c          # 内核驱动（WDM，约 600 行）
+│   └─ sysguard.c          # 内核驱动（WDM，约 1300 行）
 ├─ user/
 │   ├─ huorong_gui.py      # 仿火绒界面（tkinter，零依赖）
 │   ├─ guard_ctl.py        # IOCTL 封装（ctypes）
+│   ├─ update_check.py     # 版本自检：单独连 GitHub 查新版（可脱离本项目单独运行）
 │   ├─ elevate.py          # 自动提权（UAC，两条通道）
 │   ├─ killtest.py         # 强杀测试套件（10 项）
 │   ├─ forcekill_test.py   # 驱动级强制结束进程的验收（4 场景 7 项）
@@ -19,6 +21,7 @@ sys/
 └─ build/
     ├─ build.sh            # 编译驱动（cl + link，不依赖 MSBuild）
     ├─ sign.ps1            # 自签证书 + 签名
+    ├─ release.py          # 发版：体检 → 打 tag + push → 建 GitHub Release
     ├─ install.ps1         # 安装并加载服务（幂等；重名自动顺延）
     ├─ cleanup_old.py      # 清理遗留服务键与旧 .sys（默认只体检）
     ├─ make_autostart.py   # 配成开机自启：搬镜像 + Start=auto（幂等）
@@ -364,12 +367,72 @@ g=guard_ctl.Guard(); print(g.kill(1234, force=True)); g.close()"
 
 | 编号 | 出处 | 含义 |
 |---|---|---|
+| **1.5.0** | 仓库根 `VERSION` 文件 | **发布版本**，与 GitHub tag `v1.5.0` 对齐。版本自检只比这个 |
 | **1.5** | 驱动内 `GUARD_VERSION`（`0x00010005`） | 行为/接口版本。改了拦截逻辑或接口才升，重新编译不变 |
 | **v7** | 文件名 `sysguard_v7.sys` | 构建号。每编译一次加一，同一行为版本可以有很多构建 |
 | **sysguard7** | 服务名 | 装第几次加一，换名是为了绕开"服务键被自己锁死" |
 
 界面上统一显示成 `1.5（构建 v7）`，`python user\guard_ctl.py` 会同时打印版本、镜像路径和服务名。
 构建号由 `guard_ctl.build_tag()` 从实际加载的镜像文件名解析，不写死——换版本不会对不上。
+
+
+## 版本自检（更新检查）
+
+`user\update_check.py` 是一个**能单独拿出来跑**的版本检查器：只依赖标准库，不 import 驱动控制层、
+不需要管理员、不依赖 git 或任何连接器，纯 HTTPS 打 GitHub 公开 API。拷走这一个文件到别的机器也能用。
+
+```powershell
+python user\update_check.py            # 人读
+python user\update_check.py --json     # 机读（GUI / 脚本用）
+python user\update_check.py --force    # 忽略 6 小时缓存
+python user\update_check.py --quiet    # 只在有新版本时输出
+```
+
+输出长这样：
+
+```
+sysguard 版本自检
+  仓库     : https://github.com/23z702/windows-sysguard
+  本机版本 : 1.5.0
+  最新版本 : v1.6.0  (release)
+  发布时间 : 2026-11-20
+  结论     : 有新版本 v1.6.0（当前 1.5.0）
+  下载页   : https://github.com/23z702/windows-sysguard/releases/tag/v1.6.0
+```
+
+行为约定：
+
+- **数据来源依次退化**：`releases/latest` → `releases?per_page=1` → `tags?per_page=1`。
+  仓库一个 tag 都没有时报告「还没有任何 Release 或 Tag」，这是正常状态而不是报错。
+- **比较的是发布版本**（根目录 `VERSION`，形如 `1.5.0`，与 tag `v1.5.0` 对齐），
+  不是驱动行为版本 `1.5`，也不是构建号 `v7`。`VERSION` 缺失时才回退去解析 `GUARD_VERSION`。
+- **6 小时磁盘缓存**（`%LOCALAPPDATA%\sysguard\update.json`）：GitHub 未认证 API 每小时只给 60 次，
+  界面每次启动都裸查会被限流。`--force` 跳过缓存。
+- 设 `GITHUB_TOKEN`（也认 `GH_TOKEN` / `SYGUARD_GITHUB_TOKEN`）可把限流提到 5000 次/小时。
+- **任何失败都不抛给上层**：网络不通、限流、代理劫持都返回 `ok=False` + 中文原因，
+  界面照常工作，驱动更不受影响（这个组件完全不碰驱动句柄）。
+- 退出码：`0` 已是最新 / `10` 有新版本 / `2` 检查失败 —— 方便挂到 CI 或脚本里。
+
+界面集成：「关于」页新增「版本自检」一行 + 「检查更新」按钮；启动 1.5 秒后还会**静默**查一次，
+有新版时标题栏右侧浮出橙色角标 `↑ 新版 v1.6.0`，点一下就打开 Release 页。
+
+### 发版：让「检测」有东西可比对
+
+`build\release.py` 把发版三步串起来 —— 体检 → 打 tag 并推送 → 建 GitHub Release：
+
+```powershell
+python build\release.py --dry-run              # 只体检，不推不改
+python build\release.py --notes-file notes.md  # 正式发（说明取自文件）
+python build\release.py --version 1.6.0        # 顺手把 VERSION 改成 1.6.0 再发
+python build\release.py --prerelease           # 发预发布版
+```
+
+体检会拦住三种常见事故：工作区有未提交改动、`VERSION` 与要发的版本不一致（只有 `--version` 改过才自动提交这一个文件）、
+tag 已存在。令牌按 `GITHUB_TOKEN` 环境变量 → Windows 凭据管理器里的 git 令牌顺序取
+（后者用 `git credential fill` 读，不落盘、不打印）。
+
+> 本机 git 配的是 openssl 后端且缺 CA 链，`push` 会报 `unable to get local issuer certificate`。
+> `release.py` 检测到这个错会**只对这一条命令**关掉校验重试一次，并明确打印出来，不动全局配置。
 
 
 ## 踩过的坑

@@ -16,6 +16,8 @@ import datetime
 import os
 import subprocess
 import sys
+import threading
+import webbrowser
 
 try:
     import tkinter as tk
@@ -36,6 +38,10 @@ try:
     import elevate
 except ImportError:
     elevate = None
+try:
+    import update_check          # 版本自检：只连 GitHub，不依赖驱动/管理员
+except ImportError:
+    update_check = None
 
 # ---------------- 配色（火绒风格：白底 + 品牌绿） ----------------
 C = {
@@ -221,6 +227,8 @@ class App(tk.Tk):
         self.driver_ok = False
         self.driver_build = ""
         self._tried_autostart = False
+        self.update_info = None        # update_check.check() 的结果
+        self._update_busy = False
         self.pages = {}
         self.active = None
         self.nav_widgets = {}
@@ -231,6 +239,7 @@ class App(tk.Tk):
         self._connect_driver()
         self.show("home")
         self.after(300, self._tick)
+        self.after(1500, lambda: self.check_update(manual=False))
 
     # ---- 样式 ----
     def _build_style(self):
@@ -272,6 +281,12 @@ class App(tk.Tk):
         self.pill = tk.Label(header, text="  检测中…  ", font=F_SMALL,
                              bg="#EEF1F6", fg=C["sub"], padx=8, pady=4)
         self.pill.pack(side="right", padx=22)
+
+        # 有新版本时才 pack 出来（默认不占位），点了直接开浏览器
+        self.update_pill = tk.Label(header, text="", font=F_SMALL,
+                                    bg=C["amber"], fg="white", padx=8, pady=4,
+                                    cursor="hand2")
+        self.update_pill.bind("<Button-1>", lambda _e: self._open_release())
 
         tk.Frame(self, bg=C["line"], height=1).pack(fill="x")
 
@@ -935,6 +950,17 @@ class App(tk.Tk):
 
         self._refresh_about()
 
+        # 版本自检：单独连 GitHub 公开 API，与驱动是否加载、是否管理员都无关
+        upd = tk.Frame(card.body, bg=C["card"])
+        upd.pack(fill="x", pady=(10, 0))
+        tk.Label(upd, text="版本自检", font=F_SMALL, bg=C["card"], fg=C["sub"],
+                 width=10, anchor="w").pack(side="left")
+        self.update_val = tk.Label(upd, text="未检查", font=(FONT, 9), bg=C["card"],
+                                   fg=C["sub"], anchor="w")
+        self.update_val.pack(side="left")
+        self._btn(upd, "检查更新", lambda: self.check_update(manual=True),
+                  width=9).pack(side="left", padx=(10, 0))
+
         tk.Label(card.body, text="测试流程", font=(FONT, 10, "bold"),
                  bg=C["card"], fg=C["text"]).pack(anchor="w", pady=(20, 6))
         tk.Label(card.body,
@@ -957,6 +983,76 @@ class App(tk.Tk):
             lbl = vals.get(k)
             if lbl is not None:
                 lbl.config(text=v)
+
+        # 切回「关于」页时把上次的自检结论重刷一遍（不重复发请求）
+        if getattr(self, "update_info", None) and "update_val" in self.__dict__:
+            self._apply_update_result(self.update_info, manual=False)
+
+    # ---------------- 版本自检（单独走 GitHub） ----------------
+    def check_update(self, manual=True):
+        """manual=False 用于启动时静默检查；manual=True 会弹结果框。
+
+        网络请求放子线程，否则一次超时就把界面卡死（Tk 是单线程的）。
+        """
+        if update_check is None:
+            if manual:
+                messagebox.showwarning("检查更新", "模块缺失：user\\update_check.py")
+            return
+        if self._update_busy:
+            return
+        self._update_busy = True
+        if manual and "update_val" in self.__dict__:
+            self.update_val.config(text="正在连 GitHub…", fg=C["sub"])
+
+        def work():
+            try:
+                res = update_check.check(force=manual)
+            except Exception as e:                      # 兜底，绝不让子线程炸掉界面
+                res = {"ok": False, "error": str(e), "update": False, "local": ""}
+            self.after(0, lambda: self._apply_update_result(res, manual))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_update_result(self, res, manual):
+        self._update_busy = False
+        self.update_info = res
+        has_new = bool(res.get("ok") and res.get("update"))
+
+        if has_new:
+            self.update_pill.config(text="  ↑ 新版 %s  " % res["latest"])
+            if not self.update_pill.winfo_ismapped():
+                self.update_pill.pack(side="right", padx=(0, 8))
+        else:
+            self.update_pill.pack_forget()
+
+        if "update_val" in self.__dict__:
+            self.update_val.config(
+                text=update_check.summary(res) if update_check else res.get("error", ""),
+                fg=(C["amber"] if has_new else (C["sub"] if res.get("ok") else C["red"])))
+
+        if not manual:
+            return                                      # 静默模式：只在标题栏冒个角标
+        if not res.get("ok"):
+            messagebox.showwarning("检查更新", "检查失败：%s\n\n%s"
+                                   % (res.get("error"), "离线不影响驱动工作。"))
+            return
+        if has_new:
+            notes = (res.get("notes") or "").strip()
+            messagebox.showinfo(
+                "发现新版本 %s" % res["latest"],
+                "当前版本：%s\n最新版本：%s\n\n%s\n\n点「确定」打开下载页。"
+                % (res.get("local"), res["latest"],
+                   (notes[:800] + ("…" if len(notes) > 800 else "")) if notes else "（无发布说明）"))
+            self._open_release()
+        else:
+            messagebox.showinfo("检查更新", "已是最新版本 %s。" % res.get("local"))
+
+    def _open_release(self):
+        url = (self.update_info or {}).get("url") or ""
+        if not url and update_check is not None:
+            url = "https://github.com/%s/releases" % update_check.REPO
+        if url:
+            webbrowser.open(url)
 
     # ---------------- 驱动交互 ----------------
     def _connect_driver(self):
