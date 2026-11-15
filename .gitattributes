@@ -1,0 +1,15 @@
+* text=auto
+
+# shell 脚本必须 LF，否则 WSL/Git Bash 下 shebang 带 \r 会报错
+*.sh   text eol=lf
+*.py   text eol=lf
+
+*.ps1  text eol=crlf
+*.bat  text eol=crlf
+*.c    text eol=crlf
+*.md   text eol=lf
+
+*.sys  binary
+*.pfx  binary
+*.cer  binary
+*.bmp  binary
