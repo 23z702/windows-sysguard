@@ -81,6 +81,9 @@ def push_with_ssl_fallback(*args):
     """先按正常校验推；本机 git 用 openssl 后端找不到 CA 时，退到不校验再推一次。
 
     只在这条命令上关校验，不改全局配置；失败原因会原样打印，不吞。
+    注意：重试失败时必须打印**重试的**输出。之前这里打的是第一次的 stderr，
+    结果重试其实是因为「远端有新提交」被拒，屏幕上却一直显示 SSL 错误，
+    排查方向被彻底带偏。
     """
     p = sh(*args, check=False)
     if p.returncode == 0:
@@ -91,7 +94,12 @@ def push_with_ssl_fallback(*args):
         p = sh("-c", "http.sslVerify=false", *args, check=False)
         if p.returncode == 0:
             return True
+        msg = (p.stderr or "") + (p.stdout or "")      # 换成重试的真实输出
+
     print("[FAIL] git %s\n%s" % (" ".join(args), msg.strip()))
+    if "rejected" in msg or "fetch first" in msg or "non-fast-forward" in msg:
+        print("\n[i] 远端有你本地没有的提交（常见于在网页上直接改过文件）。"
+              "\n    先同步再发： git -c http.sslVerify=false pull --rebase origin main")
     return False
 
 
